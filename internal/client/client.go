@@ -15,10 +15,7 @@ import (
 	"github.com/bersh/alluvial_test_1/internal/config"
 	"github.com/bersh/alluvial_test_1/internal/metrics"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-
-	"github.com/bersh/alluvial_test_1/internal/config"
-	"github.com/bersh/alluvial_test_1/internal/metrics"
-	"github.com/ethereum/go-ethereum/common/hexutil"
+	"golang.org/x/sync/errgroup"
 )
 
 // PoolStruct defines the interface for the client pool
@@ -208,52 +205,37 @@ func (p *PoolStruct) QueryBalanceFromAllClients(ctx context.Context, address, bl
 		return nil, fmt.Errorf("no Ethereum clients available")
 	}
 
-	resultChan := make(chan BalanceResponse, len(clients))
-	done := make(chan struct{})
-	defer close(done)
-
-	// Create a context with timeout for each client request
 	clientCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	g, ctx := errgroup.WithContext(clientCtx)
+	responses := make([]BalanceResponse, 0, len(clients))
+	var responsesMutex sync.Mutex
+
 	for _, client := range clients {
-		go func(c *Client) {
-			select {
-			case <-clientCtx.Done():
-				resultChan <- BalanceResponse{
-					ClientName: c.Name,
-					Balance:    nil,
-					Error:      clientCtx.Err(),
-				}
-			case <-done:
-				return
-			default:
-				balance, err := c.QueryBalance(clientCtx, address, blockParam)
-				select {
-				case resultChan <- BalanceResponse{
-					ClientName: c.Name,
+		g.Go(func(client *Client) func() error {
+			return func() error {
+				balance, err := client.QueryBalance(ctx, address, blockParam)
+				response := BalanceResponse{
+					ClientName: client.Name,
 					Balance:    balance,
 					Error:      err,
-				}:
-				case <-done:
-					return
 				}
+
+				responsesMutex.Lock()
+				if err == nil {
+					responses = append(responses, response)
+				} else {
+					log.Printf("Error from client %s: %v\n", client.Name, err)
+				}
+				responsesMutex.Unlock()
+				return nil
 			}
-		}(client)
+		}(client))
 	}
 
-	responses := make([]BalanceResponse, 0, len(clients))
-	for range clients {
-		select {
-		case resp := <-resultChan:
-			if resp.Error == nil {
-				responses = append(responses, resp)
-			} else {
-				log.Printf("Error from client %s: %v\n", resp.ClientName, resp.Error)
-			}
-		case <-ctx.Done():
-			return nil, fmt.Errorf("context cancelled while waiting for responses: %w", ctx.Err())
-		}
+	if err := g.Wait(); err != nil {
+		return nil, fmt.Errorf("error while querying balances: %w", err)
 	}
 
 	if len(responses) == 0 {
